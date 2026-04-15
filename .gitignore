@@ -1,0 +1,7 @@
+*.pdf
+*.png
+FairLens_*.md
+node_modules/
+venv/
+__pycache__/
+.env
