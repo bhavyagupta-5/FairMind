@@ -50,7 +50,7 @@ class RemediationEngine:
 
     def apply_reweighing(self, file_path, protected_attr, target_col, positive_label):
         """Technique 1 — Reweighing using AIF360, falls back to sklearn sample weights."""
-        X_train, X_test, y_train, y_test, _, sensitive_test, groups = \
+        X_train, X_test, y_train, y_test, sensitive_train, sensitive_test, groups = \
             self._load_and_prepare(file_path, protected_attr, target_col, positive_label)
 
         try:
@@ -89,7 +89,7 @@ class RemediationEngine:
         except Exception as e:
             logger.warning("AIF360 failed (%s), using fairness-aware fallback", str(e))
             # Fallback: fairness-aware reweighing based on group and label
-            weights = y_train.groupby([sensitive_test.loc[y_train.index], y_train]).transform('count')
+            weights = y_train.groupby([sensitive_train, y_train]).transform('count')
             weights = 1.0 / weights
             weights = weights / weights.sum()
 
@@ -155,58 +155,38 @@ class RemediationEngine:
         logger.info("Adversarial debiasing applied (feature removal + regularisation)")
 
         return self._compute_metrics(y_pred, y_test, sensitive_test, groups)
-
+    
     def apply_combined_strategy(self, file_path, protected_attr, target_col, positive_label):
-        """Combined reweighing and threshold calibration."""
+        """Technique 4 — Combines reweighing + threshold calibration for stronger debiasing."""
         X_train, X_test, y_train, y_test, sensitive_train, sensitive_test, groups = \
             self._load_and_prepare(file_path, protected_attr, target_col, positive_label)
 
-        # 1. Reweighing
+        # Step 1 — Reweighing
         try:
-            from aif360.datasets import BinaryLabelDataset
-            from aif360.algorithms.preprocessing import Reweighing as AIF360Reweighing
-            
-            df_train = X_train.join(y_train)
-            if protected_attr not in df_train.columns:
-                df_train[protected_attr] = df_train.index.map(pd.read_csv(file_path, index_col=0)[protected_attr])
-
-            aif_ds = BinaryLabelDataset(df=df_train, label_names=[target_col], protected_attribute_names=[protected_attr])
-            rw = AIF360Reweighing(unprivileged_groups=[{protected_attr: 0}], privileged_groups=[{protected_attr: 1}])
-            ds_transformed = rw.fit_transform(aif_ds)
-            weights = ds_transformed.instance_weights
+            from sklearn.utils.class_weight import compute_sample_weight
+            weights = compute_sample_weight('balanced', y_train)
+            model = LogisticRegression(max_iter=2000, random_state=42, solver='saga')
+            model.fit(X_train, y_train, sample_weight=weights)
         except Exception as e:
-            logger.warning("AIF360 for reweighing failed (%s), using fairness-aware fallback", e)
-            weights = y_train.groupby([sensitive_train, y_train]).transform('count')
-            weights = 1.0 / weights
-            weights = weights / weights.sum()
+            logger.warning("Combined strategy reweighing step failed: %s", str(e))
+            model = LogisticRegression(max_iter=2000, random_state=42, solver='saga')
+            model.fit(X_train, y_train)
 
-        base_model = LogisticRegression(max_iter=2000, random_state=42, solver='saga')
-        base_model.fit(X_train, y_train, sample_weight=weights)
-
-        # 2. Threshold Calibration
+        # Step 2 — Threshold calibration on top of reweighed model
         try:
             from fairlearn.postprocessing import ThresholdOptimizer
             optimizer = ThresholdOptimizer(
-                estimator=base_model,
-                constraints="equalized_odds",
+                estimator=model,
+                constraints="demographic_parity",
                 predict_method="predict_proba",
                 objective="balanced_accuracy_score",
             )
             optimizer.fit(X_train, y_train, sensitive_features=sensitive_train)
             y_pred = optimizer.predict(X_test, sensitive_features=sensitive_test)
-            logger.info("Combined strategy: Reweighing + Threshold Calibration applied.")
+            logger.info("Combined strategy applied successfully")
         except Exception as e:
-            logger.warning("ThresholdOptimizer for combined strategy failed (%s), using manual fallback", e)
-            y_prob = base_model.predict_proba(X_test)[:, 1]
-            y_pred = np.zeros(len(y_prob), dtype=int)
-            sensitive_test_values = sensitive_test.values
-            for group in groups:
-                mask = (sensitive_test_values == group)
-                if not np.any(mask):
-                    continue
-                group_probs = y_prob[mask]
-                threshold = np.percentile(group_probs, 50) if len(group_probs) > 0 else 0.5
-                y_pred[mask] = (group_probs >= threshold).astype(int)
+            logger.warning("Combined strategy threshold step failed (%s), using reweighed model only", str(e))
+            y_pred = model.predict(X_test)
 
         return self._compute_metrics(y_pred, y_test, sensitive_test, groups)
 

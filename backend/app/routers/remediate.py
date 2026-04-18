@@ -19,11 +19,9 @@ class RemediateRequest(BaseModel):
 
 @router.post("/remediate")
 def remediate(req: RemediateRequest, db: Session = Depends(get_db)):
-    # Validate technique
     if req.technique not in VALID_TECHNIQUES:
         raise HTTPException(422, f"Unknown technique '{req.technique}'. Valid: {', '.join(VALID_TECHNIQUES)}")
 
-    # Validate job exists and is complete
     job = db.query(Job).filter(Job.id == req.job_id).first()
     if not job:
         raise HTTPException(404, f"Job {req.job_id} not found")
@@ -37,16 +35,19 @@ def remediate(req: RemediateRequest, db: Session = Depends(get_db)):
     positive_label = config["positive_label"]
     file_path = job.file_path
 
-    # Run selected technique
     engine = RemediationEngine()
     logger.info("Applying %s for job %s", req.technique, req.job_id)
 
-    if req.technique == "reweighing":
-        after = engine.apply_reweighing(file_path, protected_attr, target_col, positive_label)
-    elif req.technique == "threshold":
-        after = engine.apply_threshold_calibration(file_path, protected_attr, target_col, positive_label)
-    else:
-        after = engine.apply_adversarial_debiasing(file_path, protected_attr, target_col, positive_label)
+    try:
+        if req.technique == "reweighing":
+            after = engine.apply_reweighing(file_path, protected_attr, target_col, positive_label)
+        elif req.technique == "threshold":
+            after = engine.apply_threshold_calibration(file_path, protected_attr, target_col, positive_label)
+        else:
+            after = engine.apply_adversarial_debiasing(file_path, protected_attr, target_col, positive_label)
+    except Exception as e:
+        logger.error("Remediation failed for job %s: %s", req.job_id, str(e))
+        raise HTTPException(500, f"Remediation failed: {str(e)}")
 
     before = results["overall_metrics"]
     before_ratio = round(before["demographic_parity_ratio"], 2)
@@ -70,8 +71,7 @@ def remediate(req: RemediateRequest, db: Session = Depends(get_db)):
         "improvement_summary": summary,
     }
 
-    # Store remediation result in DB
     job.remediation = json.dumps(response)
     db.commit()
-
+    logger.info("Remediation complete for job %s", req.job_id)
     return response

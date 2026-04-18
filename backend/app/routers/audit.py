@@ -101,6 +101,8 @@ def run_audit_task(job_id, file_path, protected_attr, target_col, positive_label
 
         update(10, "Loading and cleaning dataset...")
         engine = AuditEngine()
+
+        update(30, "Training baseline model...")
         results = engine.run(
             file_path, protected_attr, target_col, positive_label,
             update_fn=update
@@ -109,17 +111,28 @@ def run_audit_task(job_id, file_path, protected_attr, target_col, positive_label
         job.results = json.dumps(results)
 
         update(85, "Running explainability analysis...")
-        explain_engine = ExplainEngine()
-        explanation = explain_engine.run(
-            engine.model, engine.X_test, engine.y_test,
-            engine.X_test_raw, protected_attr, engine.groups
-        )
-        explanation["job_id"] = job_id
-        job.explanation = json.dumps(explanation)
+        try:
+            explain_engine = ExplainEngine()
+            explanation = explain_engine.run(
+                engine.model, engine.X_test, engine.y_test,
+                engine.X_test_raw, protected_attr, engine.groups
+            )
+            explanation["job_id"] = job_id
+            job.explanation = json.dumps(explanation)
+        except Exception as e:
+            # Explainability failure should not crash the whole audit
+            logger.warning("Explainability failed for job %s: %s", job_id, str(e))
+            job.explanation = json.dumps({
+                "job_id": job_id,
+                "features": [],
+                "group_shap": {},
+                "top_bias_drivers": []
+            })
 
         update(100, "Complete")
         job.status = "complete"
         db.commit()
+        logger.info("Audit complete for job %s — verdict: %s", job_id, results.get("verdict"))
 
     except Exception as e:
         logger.error("Audit failed for job %s: %s", job_id, str(e))
