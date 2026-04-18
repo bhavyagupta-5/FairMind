@@ -37,51 +37,62 @@ class RemediationEngine:
 
         X = df.drop(columns=[target_col])
         y = df[target_col]
+        
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.3, random_state=42
         )
 
-        raw_test = raw_df.loc[X_test.index]
-        sensitive_test = raw_test[protected_attr].astype(str)
+        sensitive_train = raw_df.loc[X_train.index, protected_attr].astype(str)
+        sensitive_test = raw_df.loc[X_test.index, protected_attr].astype(str)
         groups = sorted(sensitive_test.unique().tolist())
 
-        return X_train, X_test, y_train, y_test, sensitive_test, groups
+        return X_train, X_test, y_train, y_test, sensitive_train, sensitive_test, groups
 
     def apply_reweighing(self, file_path, protected_attr, target_col, positive_label):
         """Technique 1 — Reweighing using AIF360, falls back to sklearn sample weights."""
-        X_train, X_test, y_train, y_test, sensitive_test, groups = \
+        X_train, X_test, y_train, y_test, _, sensitive_test, groups = \
             self._load_and_prepare(file_path, protected_attr, target_col, positive_label)
 
         try:
             from aif360.datasets import BinaryLabelDataset
             from aif360.algorithms.preprocessing import Reweighing as AIF360Reweighing
 
-            df = pd.read_csv(file_path)
-            df[target_col] = (df[target_col].astype(str) == str(positive_label)).astype(int)
-            for col in df.select_dtypes(include='object').columns:
-                df[col] = LabelEncoder().fit_transform(df[col].astype(str))
+            # AIF360 needs the full dataframe to compute weights correctly
+            df_train = X_train.join(y_train)
+            
+            # Ensure protected_attr is in the dataframe for AIF360
+            if protected_attr not in df_train.columns:
+                 df_train[protected_attr] = df_train.index.map(pd.read_csv(file_path, index_col=0)[protected_attr])
+
 
             aif_ds = BinaryLabelDataset(
-                df=df,
+                df=df_train,
                 label_names=[target_col],
                 protected_attribute_names=[protected_attr]
             )
+            
+            privileged_groups = [{protected_attr: 1}]
+            unprivileged_groups = [{protected_attr: 0}]
+
             rw = AIF360Reweighing(
-                unprivileged_groups=[{protected_attr: 0}],
-                privileged_groups=[{protected_attr: 1}]
+                unprivileged_groups=unprivileged_groups,
+                privileged_groups=privileged_groups
             )
-            rw.fit(aif_ds)
-            ds_transformed = rw.transform(aif_ds)
-            weights = ds_transformed.instance_weights[:len(X_train)]
+            
+            ds_transformed = rw.fit_transform(aif_ds)
+            weights = ds_transformed.instance_weights
 
             model = LogisticRegression(max_iter=2000, random_state=42, solver='saga')
             model.fit(X_train, y_train, sample_weight=weights)
             logger.info("Reweighing applied via AIF360")
 
         except Exception as e:
-            logger.warning("AIF360 failed (%s), using sklearn fallback", str(e))
-            from sklearn.utils.class_weight import compute_sample_weight
-            weights = compute_sample_weight('balanced', y_train)
+            logger.warning("AIF360 failed (%s), using fairness-aware fallback", str(e))
+            # Fallback: fairness-aware reweighing based on group and label
+            weights = y_train.groupby([sensitive_test.loc[y_train.index], y_train]).transform('count')
+            weights = 1.0 / weights
+            weights = weights / weights.sum()
+
             model = LogisticRegression(max_iter=2000, random_state=42, solver='saga')
             model.fit(X_train, y_train, sample_weight=weights)
 
@@ -90,7 +101,7 @@ class RemediationEngine:
 
     def apply_threshold_calibration(self, file_path, protected_attr, target_col, positive_label):
         """Technique 2 — Per-group threshold calibration using Fairlearn ThresholdOptimizer."""
-        X_train, X_test, y_train, y_test, sensitive_test, groups = \
+        X_train, X_test, y_train, y_test, sensitive_train, sensitive_test, groups = \
             self._load_and_prepare(file_path, protected_attr, target_col, positive_label)
 
         try:
@@ -105,7 +116,7 @@ class RemediationEngine:
                 predict_method="predict_proba",
                 objective="balanced_accuracy_score",
             )
-            optimizer.fit(X_train, y_train, sensitive_features=sensitive_test.loc[X_train.index] if hasattr(sensitive_test, 'loc') else sensitive_test)
+            optimizer.fit(X_train, y_train, sensitive_features=sensitive_train)
             y_pred = optimizer.predict(X_test, sensitive_features=sensitive_test)
             logger.info("Threshold calibration applied via Fairlearn")
 
@@ -115,19 +126,21 @@ class RemediationEngine:
             base_model.fit(X_train, y_train)
             y_prob = base_model.predict_proba(X_test)[:, 1]
             y_pred = np.zeros(len(y_prob), dtype=int)
+            
+            sensitive_test_values = sensitive_test.values
             for group in groups:
-                mask = (sensitive_test == group).values
-                if mask.sum() == 0:
+                mask = (sensitive_test_values == group)
+                if not np.any(mask):
                     continue
                 group_probs = y_prob[mask]
-                threshold = np.percentile(group_probs, 50)
+                threshold = np.percentile(group_probs, 50) if len(group_probs) > 0 else 0.5
                 y_pred[mask] = (group_probs >= threshold).astype(int)
 
         return self._compute_metrics(y_pred, y_test, sensitive_test, groups)
 
     def apply_adversarial_debiasing(self, file_path, protected_attr, target_col, positive_label):
         """Technique 3 — Adversarial debiasing by removing protected feature + strong regularisation."""
-        X_train, X_test, y_train, y_test, sensitive_test, groups = \
+        X_train, X_test, y_train, y_test, _, sensitive_test, groups = \
             self._load_and_prepare(file_path, protected_attr, target_col, positive_label)
 
         # Remove protected attribute from features to prevent direct discrimination
@@ -140,6 +153,60 @@ class RemediationEngine:
         model.fit(X_train_d, y_train)
         y_pred = model.predict(X_test_d)
         logger.info("Adversarial debiasing applied (feature removal + regularisation)")
+
+        return self._compute_metrics(y_pred, y_test, sensitive_test, groups)
+
+    def apply_combined_strategy(self, file_path, protected_attr, target_col, positive_label):
+        """Combined reweighing and threshold calibration."""
+        X_train, X_test, y_train, y_test, sensitive_train, sensitive_test, groups = \
+            self._load_and_prepare(file_path, protected_attr, target_col, positive_label)
+
+        # 1. Reweighing
+        try:
+            from aif360.datasets import BinaryLabelDataset
+            from aif360.algorithms.preprocessing import Reweighing as AIF360Reweighing
+            
+            df_train = X_train.join(y_train)
+            if protected_attr not in df_train.columns:
+                df_train[protected_attr] = df_train.index.map(pd.read_csv(file_path, index_col=0)[protected_attr])
+
+            aif_ds = BinaryLabelDataset(df=df_train, label_names=[target_col], protected_attribute_names=[protected_attr])
+            rw = AIF360Reweighing(unprivileged_groups=[{protected_attr: 0}], privileged_groups=[{protected_attr: 1}])
+            ds_transformed = rw.fit_transform(aif_ds)
+            weights = ds_transformed.instance_weights
+        except Exception as e:
+            logger.warning("AIF360 for reweighing failed (%s), using fairness-aware fallback", e)
+            weights = y_train.groupby([sensitive_train, y_train]).transform('count')
+            weights = 1.0 / weights
+            weights = weights / weights.sum()
+
+        base_model = LogisticRegression(max_iter=2000, random_state=42, solver='saga')
+        base_model.fit(X_train, y_train, sample_weight=weights)
+
+        # 2. Threshold Calibration
+        try:
+            from fairlearn.postprocessing import ThresholdOptimizer
+            optimizer = ThresholdOptimizer(
+                estimator=base_model,
+                constraints="equalized_odds",
+                predict_method="predict_proba",
+                objective="balanced_accuracy_score",
+            )
+            optimizer.fit(X_train, y_train, sensitive_features=sensitive_train)
+            y_pred = optimizer.predict(X_test, sensitive_features=sensitive_test)
+            logger.info("Combined strategy: Reweighing + Threshold Calibration applied.")
+        except Exception as e:
+            logger.warning("ThresholdOptimizer for combined strategy failed (%s), using manual fallback", e)
+            y_prob = base_model.predict_proba(X_test)[:, 1]
+            y_pred = np.zeros(len(y_prob), dtype=int)
+            sensitive_test_values = sensitive_test.values
+            for group in groups:
+                mask = (sensitive_test_values == group)
+                if not np.any(mask):
+                    continue
+                group_probs = y_prob[mask]
+                threshold = np.percentile(group_probs, 50) if len(group_probs) > 0 else 0.5
+                y_pred[mask] = (group_probs >= threshold).astype(int)
 
         return self._compute_metrics(y_pred, y_test, sensitive_test, groups)
 
